@@ -41,7 +41,9 @@ try:
 except ValueError as exc:
     raise RuntimeError("ADMIN_ID must be a numeric Telegram user ID") from exc
 
-INTERVAL_SECONDS = 5
+DEFAULT_INTERVAL_SECONDS = 5
+MIN_INTERVAL_SECONDS = 1
+MAX_INTERVAL_SECONDS = 86400
 DEFAULT_START_NUMBER = 1
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 STATE_FILE = DATA_DIR / "state.json"
@@ -65,6 +67,7 @@ state: Dict[str, Any] = {
     "channel": None,
     "next_number": DEFAULT_START_NUMBER,
     "running": False,
+    "interval_seconds": DEFAULT_INTERVAL_SECONDS,
 }
 
 # Admin panel conversation mode. Only the single ADMIN_ID can use it.
@@ -72,6 +75,7 @@ ADMIN_MODE = "admin_mode"
 MODE_NONE = None
 MODE_WAIT_CHANNEL = "wait_channel"
 MODE_WAIT_START_NUMBER = "wait_start_number"
+MODE_WAIT_INTERVAL = "wait_interval"
 
 # A reference to the application is needed by the counter task.
 application_ref: Optional[Application] = None
@@ -110,12 +114,14 @@ def load_state() -> None:
         next_number = int(loaded.get("next_number", DEFAULT_START_NUMBER))
         if next_number < 0:
             next_number = DEFAULT_START_NUMBER
-
+        interval_seconds = int(loaded.get("interval_seconds", DEFAULT_INTERVAL_SECONDS))
+        interval_seconds = max(MIN_INTERVAL_SECONDS, min(interval_seconds, MAX_INTERVAL_SECONDS))
         running = bool(loaded.get("running", False))
         state = {
             "channel": channel,
             "next_number": next_number,
             "running": running,
+            "interval_seconds": interval_seconds,
         }
         logger.info("State loaded: %s", state)
     except Exception as exc:
@@ -124,6 +130,7 @@ def load_state() -> None:
             "channel": None,
             "next_number": DEFAULT_START_NUMBER,
             "running": False,
+            "interval_seconds": DEFAULT_INTERVAL_SECONDS,
         }
 
 
@@ -156,8 +163,9 @@ def panel_keyboard() -> ReplyKeyboardMarkup:
         [
             ["📢 تنظیم کانال", "✅ بررسی کانال"],
             ["▶️ شروع", "⏸ توقف"],
-            ["🔢 عدد شروع", "📊 وضعیت"],
-            ["🗑 حذف کانال", "❓ راهنما"],
+            ["🔢 عدد شروع", "⏱ فاصله ارسال"],
+            ["📊 وضعیت", "🗑 حذف کانال"],
+            ["❓ راهنما"],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -182,13 +190,11 @@ def status_text() -> str:
         f"کانال: {current_channel_text()}\n"
         f"وضعیت: {running}\n"
         f"عدد بعدی: {state.get('next_number', DEFAULT_START_NUMBER)}\n"
-        f"فاصله ارسال: {INTERVAL_SECONDS} ثانیه"
+        f"فاصله ارسال: {state.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)} ثانیه"
     )
 
 
 async def safe_state_save() -> None:
-    # JSON + fsync can perform blocking disk I/O. Run it in a worker thread
-    # so it can never freeze Telegram polling.
     async with state_lock:
         await asyncio.to_thread(save_state)
 
@@ -215,7 +221,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "3) آیدی کانال مثل -1001234567890 یا یوزرنیم مثل @mychannel را بفرست.\n"
         "4) «✅ بررسی کانال» را بزن.\n"
         "5) برای شروع «▶️ شروع» را بزن.\n\n"
-        "ربات هر ۵ ثانیه یک عدد می‌فرستد: 1، 2، 3، 4، ...\n"
+        "ربات طبق فاصله‌ای که در «⏱ فاصله ارسال» تعیین می‌کنی عدد می‌فرستد: 1، 2، 3، 4، ...\n"
         "با «⏸ توقف» متوقف می‌شود و با شروع دوباره از همان عدد ادامه می‌دهد."
     )
     await update.message.reply_text(text, reply_markup=panel_keyboard())
@@ -353,6 +359,43 @@ async def process_start_number(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def set_interval_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    context.user_data[ADMIN_MODE] = MODE_WAIT_INTERVAL
+    await update.message.reply_text(
+        "⏱ فاصله ارسال را به ثانیه بفرست.\n\n"
+        "مثال: 5 = هر ۵ ثانیه\n"
+        "10 = هر ۱۰ ثانیه\n"
+        "60 = هر ۱ دقیقه\n"
+        "3600 = هر ۱ ساعت\n\n"
+        f"حداقل: {MIN_INTERVAL_SECONDS} ثانیه\n"
+        f"حداکثر: {MAX_INTERVAL_SECONDS} ثانیه\n\n"
+        "برای لغو /cancel را بفرست.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def process_interval(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    try:
+        seconds = int(text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ فقط عدد صحیح بر حسب ثانیه بفرست. مثال: 5")
+        return
+    if seconds < MIN_INTERVAL_SECONDS or seconds > MAX_INTERVAL_SECONDS:
+        await update.message.reply_text(
+            f"❌ فاصله باید بین {MIN_INTERVAL_SECONDS} تا {MAX_INTERVAL_SECONDS} ثانیه باشد."
+        )
+        return
+    state["interval_seconds"] = seconds
+    await safe_state_save()
+    context.user_data[ADMIN_MODE] = MODE_NONE
+    await update.message.reply_text(
+        f"✅ فاصله ارسال روی {seconds} ثانیه تنظیم شد.",
+        reply_markup=panel_keyboard(),
+    )
+
+
 async def check_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update):
         return
@@ -391,8 +434,8 @@ async def start_counter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         "🟢 شمارش شروع شد.\n"
-        f"عدد بعدی: {state['next_number']}\n"
-        "هر ۵ ثانیه یک پیام ارسال می‌شود.",
+        f"عدد بعدی: {state["next_number"]}\n"
+        f"فاصله ارسال: {state.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)} ثانیه",
         reply_markup=panel_keyboard(),
     )
 
@@ -446,6 +489,9 @@ async def panel_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if mode == MODE_WAIT_START_NUMBER:
         await process_start_number(update, context, text)
         return
+    if mode == MODE_WAIT_INTERVAL:
+        await process_interval(update, context, text)
+        return
 
     actions = {
         "📢 تنظیم کانال": set_channel_request,
@@ -453,6 +499,7 @@ async def panel_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "▶️ شروع": start_counter,
         "⏸ توقف": stop_counter,
         "🔢 عدد شروع": set_start_number_request,
+        "⏱ فاصله ارسال": set_interval_request,
         "📊 وضعیت": show_status,
         "🗑 حذف کانال": remove_channel,
         "❓ راهنما": help_command,
@@ -482,151 +529,64 @@ async def cancel_counter_task() -> None:
 
 
 async def counter_loop(app: Application) -> None:
-    """
-    Resilient counter worker.
-
-    Important:
-    - Never blocks the Telegram update loop with time.sleep().
-    - Temporary network/rate-limit errors do NOT stop the counter.
-    - Only permanent channel/access errors stop the counter.
-    - A failed send does not increment the number.
-    """
     global counter_task
     logger.info("Counter loop started")
-
     try:
         while True:
             if not state.get("running"):
                 await asyncio.sleep(0.5)
                 continue
-
-            channel = state.get("channel")
+            channel=state.get("channel")
             if not channel:
-                state["running"] = False
+                state["running"]=False
                 await safe_state_save()
                 await asyncio.sleep(0.5)
                 continue
-
-            number = int(state.get("next_number", DEFAULT_START_NUMBER))
-            chat_id = channel["chat_id"]
-
+            number=int(state.get("next_number",DEFAULT_START_NUMBER))
+            chat_id=channel["chat_id"]
+            interval=max(MIN_INTERVAL_SECONDS,min(int(state.get("interval_seconds",DEFAULT_INTERVAL_SECONDS)),MAX_INTERVAL_SECONDS))
             try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=str(number),
-                )
-
-                # Increment only after Telegram confirms the message.
-                state["next_number"] = number + 1
-
-                # Saving is done outside the critical Telegram update path.
-                # It is still awaited so the next number is safely persisted.
+                await app.bot.send_message(chat_id=chat_id,text=str(number))
+                state["next_number"]=number+1
                 await safe_state_save()
-
-                logger.info(
-                    "Sent number %s to %s; next=%s",
-                    number,
-                    chat_id,
-                    state["next_number"],
-                )
-
-                await asyncio.sleep(INTERVAL_SECONDS)
-
+                logger.info("Sent number=%s next=%s interval=%ss",number,state["next_number"],interval)
+                await asyncio.sleep(interval)
             except RetryAfter as exc:
-                # Telegram asked us to wait. Do not kill the bot.
-                retry_seconds = max(float(exc.retry_after), 1.0)
-                logger.warning(
-                    "Telegram rate limit after number %s. Retrying in %.1f seconds.",
-                    number,
-                    retry_seconds,
-                )
-                await asyncio.sleep(retry_seconds)
-
-            except (TimedOut, NetworkError) as exc:
-                # Temporary network problem. Keep the same number and retry.
-                logger.warning(
-                    "Temporary Telegram/network error while sending %s: %s. "
-                    "Retrying in 5 seconds.",
-                    number,
-                    exc,
-                )
+                wait=max(float(exc.retry_after),1.0)
+                logger.warning("Telegram rate limit; waiting %.1fs",wait)
+                await asyncio.sleep(wait)
+            except (TimedOut,NetworkError) as exc:
+                logger.warning("Temporary network error: %s; retrying in 5s",exc)
                 await asyncio.sleep(5)
-
             except Forbidden as exc:
-                # Usually bot was removed, blocked, or lost permission.
-                logger.error(
-                    "Bot no longer has permission to send to %s: %s",
-                    chat_id,
-                    exc,
-                )
-                state["running"] = False
+                logger.error("Permission error: %s",exc)
+                state["running"]=False
                 await safe_state_save()
-
                 try:
-                    await app.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            "⛔ شمارش متوقف شد چون ربات اجازه ارسال در کانال را ندارد.\n\n"
-                            f"کانال: {current_channel_text()}\n"
-                            f"خطا: {exc}"
-                        ),
-                    )
+                    await app.bot.send_message(chat_id=ADMIN_ID,text=f"⛔ ارسال به کانال ممکن نیست.\nخطا: {exc}")
                 except TelegramError:
-                    logger.exception("Could not notify admin about permission error.")
-
+                    pass
                 await asyncio.sleep(2)
-
             except BadRequest as exc:
-                # BadRequest is normally a permanent/configuration problem.
-                logger.error(
-                    "Telegram rejected message %s for %s: %s",
-                    number,
-                    chat_id,
-                    exc,
-                )
-                state["running"] = False
+                logger.error("Telegram rejected message: %s",exc)
+                state["running"]=False
                 await safe_state_save()
-
                 try:
-                    await app.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            "⛔ شمارش متوقف شد چون تلگرام ارسال پیام را رد کرد.\n\n"
-                            f"کانال: {current_channel_text()}\n"
-                            f"خطا: {exc}"
-                        ),
-                    )
+                    await app.bot.send_message(chat_id=ADMIN_ID,text=f"⛔ تلگرام ارسال را رد کرد.\nخطا: {exc}")
                 except TelegramError:
-                    logger.exception("Could not notify admin about BadRequest.")
-
+                    pass
                 await asyncio.sleep(2)
-
             except TelegramError as exc:
-                # Unknown Telegram API error: do NOT crash the worker.
-                # Retry after a short delay and keep the same number.
-                logger.exception(
-                    "Telegram API error while sending %s: %s. "
-                    "Counter remains alive; retrying in 5 seconds.",
-                    number,
-                    exc,
-                )
+                logger.exception("Telegram API error; retrying in 5s: %s",exc)
                 await asyncio.sleep(5)
-
-            except Exception as exc:
-                # Last-resort protection: an unexpected error must not kill
-                # the entire bot process or silently destroy the counter.
-                logger.exception(
-                    "Unexpected counter error while sending %s. "
-                    "Retrying in 5 seconds.",
-                    number,
-                )
+            except Exception:
+                logger.exception("Unexpected counter error; retrying in 5s")
                 await asyncio.sleep(5)
-
     except asyncio.CancelledError:
         logger.info("Counter loop cancelled")
         raise
     finally:
-        counter_task = None
+        counter_task=None
 
 
 async def ensure_counter_task(app: Application) -> None:
@@ -638,23 +598,12 @@ async def ensure_counter_task(app: Application) -> None:
 async def post_init(app: Application) -> None:
     global application_ref
     application_ref = app
-
-    # Load state once when the process starts.
     load_state()
-
-    # Polling and webhook must not run at the same time.
     await app.bot.delete_webhook(drop_pending_updates=False)
-
     if state.get("running") and state.get("channel"):
-        # Resume automatically after a process restart.
+        # Start automatically after a restart when saved state says running.
         await ensure_counter_task(app)
-
-    logger.info(
-        "Bot initialized | running=%s | channel=%s | next=%s",
-        state.get("running"),
-        bool(state.get("channel")),
-        state.get("next_number"),
-    )
+    logger.info("Bot initialized")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -670,6 +619,7 @@ async def health(_: web.Request) -> web.Response:
             "running": bool(state.get("running")),
             "channel_configured": bool(state.get("channel")),
             "next_number": state.get("next_number"),
+            "interval_seconds": state.get("interval_seconds", DEFAULT_INTERVAL_SECONDS),
         }
     )
 
