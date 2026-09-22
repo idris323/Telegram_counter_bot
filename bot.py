@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 from aiohttp import web
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError, RetryAfter, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -187,8 +187,10 @@ def status_text() -> str:
 
 
 async def safe_state_save() -> None:
+    # JSON + fsync can perform blocking disk I/O. Run it in a worker thread
+    # so it can never freeze Telegram polling.
     async with state_lock:
-        save_state()
+        await asyncio.to_thread(save_state)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,49 +482,146 @@ async def cancel_counter_task() -> None:
 
 
 async def counter_loop(app: Application) -> None:
+    """
+    Resilient counter worker.
+
+    Important:
+    - Never blocks the Telegram update loop with time.sleep().
+    - Temporary network/rate-limit errors do NOT stop the counter.
+    - Only permanent channel/access errors stop the counter.
+    - A failed send does not increment the number.
+    """
     global counter_task
     logger.info("Counter loop started")
+
     try:
         while True:
             if not state.get("running"):
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
             channel = state.get("channel")
             if not channel:
                 state["running"] = False
                 await safe_state_save()
+                await asyncio.sleep(0.5)
                 continue
 
-            number = state.get("next_number", DEFAULT_START_NUMBER)
+            number = int(state.get("next_number", DEFAULT_START_NUMBER))
             chat_id = channel["chat_id"]
 
             try:
-                await app.bot.send_message(chat_id=chat_id, text=str(number))
-            except (Forbidden, BadRequest, TelegramError) as exc:
-                logger.error("Could not send number %s to %s: %s", number, chat_id, exc)
-                # Stop on permission/access problems instead of spamming failed requests.
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=str(number),
+                )
+
+                # Increment only after Telegram confirms the message.
+                state["next_number"] = number + 1
+
+                # Saving is done outside the critical Telegram update path.
+                # It is still awaited so the next number is safely persisted.
+                await safe_state_save()
+
+                logger.info(
+                    "Sent number %s to %s; next=%s",
+                    number,
+                    chat_id,
+                    state["next_number"],
+                )
+
+                await asyncio.sleep(INTERVAL_SECONDS)
+
+            except RetryAfter as exc:
+                # Telegram asked us to wait. Do not kill the bot.
+                retry_seconds = max(float(exc.retry_after), 1.0)
+                logger.warning(
+                    "Telegram rate limit after number %s. Retrying in %.1f seconds.",
+                    number,
+                    retry_seconds,
+                )
+                await asyncio.sleep(retry_seconds)
+
+            except (TimedOut, NetworkError) as exc:
+                # Temporary network problem. Keep the same number and retry.
+                logger.warning(
+                    "Temporary Telegram/network error while sending %s: %s. "
+                    "Retrying in 5 seconds.",
+                    number,
+                    exc,
+                )
+                await asyncio.sleep(5)
+
+            except Forbidden as exc:
+                # Usually bot was removed, blocked, or lost permission.
+                logger.error(
+                    "Bot no longer has permission to send to %s: %s",
+                    chat_id,
+                    exc,
+                )
                 state["running"] = False
                 await safe_state_save()
+
                 try:
                     await app.bot.send_message(
                         chat_id=ADMIN_ID,
                         text=(
-                            "⛔ شمارش متوقف شد چون ارسال به کانال ناموفق بود.\n\n"
+                            "⛔ شمارش متوقف شد چون ربات اجازه ارسال در کانال را ندارد.\n\n"
                             f"کانال: {current_channel_text()}\n"
                             f"خطا: {exc}"
                         ),
                     )
                 except TelegramError:
-                    pass
-                await asyncio.sleep(2)
-                continue
+                    logger.exception("Could not notify admin about permission error.")
 
-            # Increment only after a successful send, so no numbers are skipped
-            # because of a Telegram/API error.
-            state["next_number"] = number + 1
-            await safe_state_save()
-            await asyncio.sleep(INTERVAL_SECONDS)
+                await asyncio.sleep(2)
+
+            except BadRequest as exc:
+                # BadRequest is normally a permanent/configuration problem.
+                logger.error(
+                    "Telegram rejected message %s for %s: %s",
+                    number,
+                    chat_id,
+                    exc,
+                )
+                state["running"] = False
+                await safe_state_save()
+
+                try:
+                    await app.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            "⛔ شمارش متوقف شد چون تلگرام ارسال پیام را رد کرد.\n\n"
+                            f"کانال: {current_channel_text()}\n"
+                            f"خطا: {exc}"
+                        ),
+                    )
+                except TelegramError:
+                    logger.exception("Could not notify admin about BadRequest.")
+
+                await asyncio.sleep(2)
+
+            except TelegramError as exc:
+                # Unknown Telegram API error: do NOT crash the worker.
+                # Retry after a short delay and keep the same number.
+                logger.exception(
+                    "Telegram API error while sending %s: %s. "
+                    "Counter remains alive; retrying in 5 seconds.",
+                    number,
+                    exc,
+                )
+                await asyncio.sleep(5)
+
+            except Exception as exc:
+                # Last-resort protection: an unexpected error must not kill
+                # the entire bot process or silently destroy the counter.
+                logger.exception(
+                    "Unexpected counter error while sending %s. "
+                    "Retrying in 5 seconds.",
+                    number,
+                )
+                await asyncio.sleep(5)
+
     except asyncio.CancelledError:
         logger.info("Counter loop cancelled")
         raise
@@ -539,12 +638,23 @@ async def ensure_counter_task(app: Application) -> None:
 async def post_init(app: Application) -> None:
     global application_ref
     application_ref = app
+
+    # Load state once when the process starts.
     load_state()
+
+    # Polling and webhook must not run at the same time.
     await app.bot.delete_webhook(drop_pending_updates=False)
+
     if state.get("running") and state.get("channel"):
-        # Start automatically after a restart when saved state says running.
+        # Resume automatically after a process restart.
         await ensure_counter_task(app)
-    logger.info("Bot initialized")
+
+    logger.info(
+        "Bot initialized | running=%s | channel=%s | next=%s",
+        state.get("running"),
+        bool(state.get("channel")),
+        state.get("next_number"),
+    )
 
 
 async def post_shutdown(app: Application) -> None:
